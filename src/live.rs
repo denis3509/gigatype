@@ -1,6 +1,6 @@
 //! Incremental GigaAM recognition with reversible IBus composition on GNOME.
 
-use super::{audio, dirs_home, model, notify, postprocess, runtime_dir, save_history,
+use super::{audio, dirs_home, model, notify, runtime_dir, save_history,
     socket_path, MediaGuard, SoundCue, SuspendDetector, play_sound};
 use std::collections::VecDeque;
 use std::env;
@@ -99,7 +99,7 @@ struct ResultText {
     session: u64,
     segment: u64,
     final_text: bool,
-    text: Result<String, String>,
+    text: Result<model::Hypothesis, String>,
 }
 
 struct Session {
@@ -115,6 +115,7 @@ struct Session {
     voice_samples: usize,
     voice_end: usize,
     pending_finals: usize,
+    hypotheses: VecDeque<String>,
 }
 
 impl Drop for Session {
@@ -141,7 +142,8 @@ impl Session {
         notify("Диктовка", "Текст появляется во время речи. F9 — закончить; Shift+F9 — отменить фразу.");
         Ok(Self { id, recorder: Some(recorder), media: Some(media), started: now,
             last_poll: now, last_preview: now, scanned: 0, segment_start: 0,
-            segment: 0, voice_samples: 0, voice_end: 0, pending_finals: 0 })
+            segment: 0, voice_samples: 0, voice_end: 0, pending_finals: 0,
+            hypotheses: VecDeque::new() })
     }
 
     fn scan(&mut self, audio: &[f32], threshold: f32) {
@@ -173,6 +175,7 @@ impl Session {
             }
         }
         self.segment += 1;
+        self.hypotheses.clear();
         self.segment_start = audio.len();
         self.voice_samples = 0;
         self.voice_end = audio.len();
@@ -205,6 +208,9 @@ pub fn daemon() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     listener.set_nonblocking(true).map_err(|error| error.to_string())?;
     let model = model::GigaAm::load_default()?;
+    let confidence = env::var("GIGATYPE_LIVE_MIN_CONFIDENCE").ok()
+        .and_then(|value| value.parse::<f32>().ok()).filter(|value| value.is_finite())
+        .unwrap_or(0.55).clamp(0.0, 1.0);
     let (requests, incoming) = mpsc::channel::<Request>();
     let (outgoing, results) = mpsc::channel::<ResultText>();
     thread::spawn(move || {
@@ -212,7 +218,12 @@ pub fn daemon() -> Result<(), String> {
         while let Ok(mut job) = incoming.recv() {
             job.samples.resize(job.samples.len() + RATE / 4, 0.0);
             let started = Instant::now();
-            let text = model.transcribe_samples(&job.samples);
+            let text = if job.final_text {
+                model.transcribe_samples(&job.samples)
+                    .map(|text| model::Hypothesis { text, preview: String::new() })
+            } else {
+                model.transcribe_partial(&job.samples, confidence)
+            };
             eprintln!("GigaType live: {} recognition in {:.2}s", if job.final_text { "final" } else { "partial" }, started.elapsed().as_secs_f64());
             if outgoing.send(ResultText { session: job.session, segment: job.segment,
                 final_text: job.final_text, text }).is_err() { break; }
@@ -226,8 +237,10 @@ pub fn daemon() -> Result<(), String> {
     let mut next_id = 0;
     let mut suspend = SuspendDetector::new();
     let mut checked_focus = Instant::now();
-    let interval = Duration::from_millis(env_u64("GIGATYPE_LIVE_INTERVAL_MS", 900).clamp(250, 5000));
-    let pause = env_u64("GIGATYPE_LIVE_PAUSE_MS", 800).clamp(300, 3000) as usize * RATE / 1000;
+    let interval = Duration::from_millis(env_u64("GIGATYPE_LIVE_INTERVAL_MS", 500).clamp(250, 5000));
+    let pause = env_u64("GIGATYPE_LIVE_PAUSE_MS", 1800).clamp(300, 5000) as usize * RATE / 1000;
+    let initial_audio = env_u64("GIGATYPE_LIVE_INITIAL_MS", 1200).clamp(300, 5000) as usize * RATE / 1000;
+    let confirmations = env_u64("GIGATYPE_LIVE_CONFIRMATIONS", 2).clamp(1, 4) as usize;
     let maximum = Duration::from_millis(env_u64("GIGATYPE_MAX_RECORDING_MS", 120_000).max(1000));
     let threshold = env::var("GIGATYPE_LIVE_SILENCE_RMS").ok()
         .and_then(|value| value.parse::<f32>().ok()).filter(|value| value.is_finite() && *value > 0.0)
@@ -254,18 +267,32 @@ pub fn daemon() -> Result<(), String> {
             busy = false;
             let Some(session) = active.as_mut().filter(|session| session.id == result.session) else { continue; };
             if !result.final_text && (session.segment != result.segment || session.recorder.is_none()) { continue; }
-            let outcome = result.text.and_then(|text| {
-                let text = if result.final_text { postprocess(&text) } else {
-                    super::capitalize_first(&text.split_whitespace().collect::<Vec<_>>().join(" "))
-                };
+            let outcome = result.text.and_then(|hypothesis| {
                 if result.final_text {
+                    // Pauses are not automatic sentence boundaries.
+                    let text = super::format_transcript(&hypothesis.text, false);
                     session.pending_finals = session.pending_finals.saturating_sub(1);
                     if !text.is_empty() {
-                        bridge.request("commit", &format!("{text} "))?;
+                        bridge.request("commit", &text)?;
                         save_history(&text)?;
+                    } else {
+                        bridge.request("preview", "")?;
                     }
-                } else if !text.is_empty() {
-                    bridge.request("preview", &text)?;
+                } else {
+                    let text = hypothesis.preview.split_whitespace().collect::<Vec<_>>().join(" ");
+                    session.hypotheses.push_back(text);
+                    while session.hypotheses.len() > confirmations { session.hypotheses.pop_front(); }
+                    if session.hypotheses.len() == confirmations {
+                        let mut common = session.hypotheses[0].clone();
+                        for text in session.hypotheses.iter().skip(1) {
+                            common = common.chars().zip(text.chars())
+                                .take_while(|(left, right)| left == right).map(|(left, _)| left).collect();
+                        }
+                        // A truncated subword is shown only after repeated confirmation.
+                        // Sentence-final punctuation waits for final recognition.
+                        let common = common.trim_end_matches(|c: char| c.is_whitespace() || ".!?…,:;".contains(c));
+                        bridge.request("preview", common)?;
+                    }
                 }
                 Ok(())
             });
@@ -297,7 +324,8 @@ pub fn daemon() -> Result<(), String> {
                             || audio.len().saturating_sub(session.segment_start) >= RATE * 18) {
                             session.final_segment(&audio, &mut queue);
                         } else if !busy && queue.is_empty() && session.pending_finals == 0
-                            && session.voice_samples >= RATE / 5 && session.last_preview.elapsed() >= interval {
+                            && session.voice_samples >= RATE / 5 && session.last_preview.elapsed() >= interval
+                            && audio.len().saturating_sub(session.segment_start) >= initial_audio {
                             session.last_preview = Instant::now();
                             requests.send(Request { session: session.id, segment: session.segment,
                                 final_text: false, samples: audio[session.segment_start..].to_vec() })

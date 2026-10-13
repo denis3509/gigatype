@@ -27,6 +27,11 @@ pub struct GigaAm {
     tokenizer: SentencePieceProcessor,
 }
 
+pub struct Hypothesis {
+    pub text: String,
+    pub preview: String,
+}
+
 impl GigaAm {
     pub fn load_default() -> Result<Self, String> {
         Self::load(&model_dir())
@@ -74,6 +79,10 @@ impl GigaAm {
     }
 
     fn transcribe_short(&mut self, samples: &[f32]) -> Result<String, String> {
+        self.transcribe_partial(samples, 0.0).map(|hypothesis| hypothesis.text)
+    }
+
+    pub fn transcribe_partial(&mut self, samples: &[f32], minimum_confidence: f32) -> Result<Hypothesis, String> {
         let (features, frames) = log_mel(samples)?;
         let feature_tensor = Tensor::from_array(([1, N_MELS, frames], features))
             .map_err(|error| error.to_string())?;
@@ -101,7 +110,7 @@ impl GigaAm {
             .map_err(|error| error.to_string())?;
         let active_frames = encoded_lengths.first().copied().unwrap_or_default().max(0) as usize;
         drop(outputs);
-        self.decode_rnnt(&encoded, encoded_frames, active_frames)
+        self.decode_rnnt(&encoded, encoded_frames, active_frames, minimum_confidence)
     }
 
     fn decode_rnnt(
@@ -109,9 +118,11 @@ impl GigaAm {
         encoded: &[f32],
         encoded_frames: usize,
         active_frames: usize,
-    ) -> Result<String, String> {
+        minimum_confidence: f32,
+    ) -> Result<Hypothesis, String> {
         let blank = self.tokenizer.piece_size() as i64;
         let mut tokens = Vec::<u32>::new();
+        let mut probabilities = Vec::<f32>::new();
         let mut last_label = blank;
         let mut hidden = vec![0.0_f32; PREDICTOR_WIDTH];
         let mut cell = vec![0.0_f32; PREDICTOR_WIDTH];
@@ -156,26 +167,35 @@ impl GigaAm {
                 let (_, logits) = joint_outputs["joint"]
                     .try_extract_tensor::<f32>()
                     .map_err(|error| error.to_string())?;
-                let token = logits
+                let (token, maximum) = logits
                     .iter()
                     .enumerate()
                     .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                    .map(|(index, _)| index as i64)
+                    .map(|(index, value)| (index as i64, *value))
                     .ok_or_else(|| "GigaAM joint network returned no logits".to_string())?;
-                drop(joint_outputs);
                 if token == blank {
                     break;
                 }
+                // Normalize both raw logits and log-softmax exports safely.
+                // This is a token posterior, not a calibrated correctness score.
+                let denominator = logits.iter().map(|value| (value - maximum).exp()).sum::<f32>();
+                let probability = if denominator.is_finite() && denominator >= 1.0 {
+                    1.0 / denominator
+                } else { 0.0 };
+                drop(joint_outputs);
                 tokens.push(token as u32);
+                probabilities.push(probability);
                 last_label = token;
                 hidden = next_hidden;
                 cell = next_cell;
                 has_state = true;
             }
         }
-        self.tokenizer
-            .decode(&tokens.iter().map(|&token| token as i32).collect::<Vec<_>>())
-            .map_err(|error| format!("could not decode GigaAM tokens: {error}"))
+        let ids = tokens.iter().map(|&token| token as i32).collect::<Vec<_>>();
+        let decode = |ids: &[i32]| self.tokenizer.decode(ids)
+            .map_err(|error| format!("could not decode GigaAM tokens: {error}"));
+        let reliable = probabilities.iter().take_while(|&&value| value >= minimum_confidence).count();
+        Ok(Hypothesis { text: decode(&ids)?, preview: decode(&ids[..reliable])? })
     }
 }
 

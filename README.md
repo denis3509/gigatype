@@ -47,7 +47,7 @@ desktops keep the original record-then-insert mode. Requires `/usr/bin/python3`,
 
 - Focus a text field and press **F9**. An underlined draft appears while speaking
   and is revised as more audio arrives.
-- After a pause (800 ms by default), the phrase is committed and dictation continues.
+- After a pause (1800 ms by default), the phrase is committed and dictation continues.
 - Press **F9** again to finish the final phrase, or **Shift+F9** to discard the
   current uncommitted phrase. Phrases already committed remain in the document.
 - Changing the input context, typing manually, or moving the cursor stops dictation
@@ -57,17 +57,42 @@ desktops keep the original record-then-insert mode. Requires `/usr/bin/python3`,
 
 This uses repeated recognition of the accumulated phrase with the existing local
 GigaAM v3 ONNX model, rather than a native streaming encoder. Updates are requested
-every 900 ms; actual latency also includes inference time. Long continuous speech
+every 500 ms after at least 1200 ms of phrase audio; actual latency also includes
+inference time and confirmation. Only the common prefix of two consecutive
+confidence-filtered hypotheses is previewed. The first token below the configured
+posterior threshold holds back the remaining draft until it becomes more reliable
+or final recognition completes. Final recognition retains the entire result.
+These token posteriors are not calibrated probabilities of correctness: a stable,
+high-scoring hypothesis may still be wrong.
+
+The confirmed draft is revealed one Unicode character at a time with a default
+12 ms interval, speeding up for long additions. Corrections preserve the common
+prefix. This is presentation smoothing of available hypotheses, not a new streaming
+speech model. `GIGATYPE_LIVE_CHARACTER_MS=0` disables the animation.
+
+Where the app supplies IBus surrounding text, the preceding 512 characters are
+used locally for spacing and sentence case. This text is not logged or sent to
+the acoustic model. The current model has no document prompt input; semantic
+conditioning on previously typed text is not implemented. Pauses no longer force
+a period; punctuation is taken from the model or spoken punctuation commands.
+Long continuous speech
 is split after 18 seconds to bound the amount reprocessed. Final phrases are saved
 in the existing transcript history; intermediate drafts are not saved.
 
 Optional service environment settings: `GIGATYPE_LIVE_INTERVAL_MS` (250–5000 ms),
-`GIGATYPE_LIVE_PAUSE_MS` (300–3000 ms), and `GIGATYPE_LIVE_SILENCE_RMS` (positive
+`GIGATYPE_LIVE_PAUSE_MS` (300–5000 ms), and `GIGATYPE_LIVE_SILENCE_RMS` (positive
 normalized microphone RMS, default `80/32768`). Microphone selection still uses
 `GIGATYPE_MICROPHONE`. Explicitly set `GIGATYPE_LIVE=1` to request live mode;
 `auto` selects it only on GNOME/X11.
 The existing 120-second session limit is retained; `GIGATYPE_MAX_RECORDING_MS`
 can change it. At the limit, the last phrase is finalized automatically.
+
+Preview tuning: `GIGATYPE_LIVE_INITIAL_MS` (300–5000, default 1200),
+`GIGATYPE_LIVE_CONFIRMATIONS` (1–4, default 2),
+`GIGATYPE_LIVE_MIN_CONFIDENCE` (0–1, default 0.55), and
+`GIGATYPE_LIVE_CHARACTER_MS` (0–80, default 12). More confirmations or a higher
+threshold delay more uncertain drafts; lowering them makes previews faster and
+more prone to revisions. Settings can be added to a systemd user service override.
 
 ## Local data
 

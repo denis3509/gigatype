@@ -48,6 +48,10 @@ Commands:
 ";
 
 fn postprocess(input: &str) -> String {
+    format_transcript(input, true)
+}
+
+fn format_transcript(input: &str, ensure_period: bool) -> String {
     let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut normalized = format!(" {normalized} ");
     for (spoken, symbol) in [
@@ -77,7 +81,7 @@ fn postprocess(input: &str) -> String {
         return result;
     }
 
-    if !result.ends_with(['.', '!', '?', '…']) {
+    if ensure_period && !result.ends_with(['.', '!', '?', '…']) {
         result.push('.');
     }
     result

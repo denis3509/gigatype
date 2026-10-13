@@ -19,13 +19,95 @@ IBus.init()
 
 class DictationEngine(IBus.Engine):
     def __init__(self, controller, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(active_surrounding_text=True, **kwargs)
         self.controller = controller
         self.focused = False
         self.text = ""
+        self.target = ""
+        self.animation = 0
+        self.before = ""
+        self.surrounding_before = None
+        self.composition_started = False
+
+    def stop_animation(self):
+        if self.animation:
+            GLib.source_remove(self.animation)
+            self.animation = 0
+
+    def prepare(self, value):
+        if not value:
+            return ""
+        before = self.before.rstrip()
+        boundary = before.rstrip('\"\'»”)]')
+        sentence_start = not before or self.before.rstrip(" \t").endswith("\n") or boundary.endswith(tuple(".!?…"))
+        first_word = value.split(None, 1)[0]
+        # Preserve acronyms. GigaAM often capitalizes every isolated audio segment.
+        if value[0].isalpha() and sum(char.isupper() for char in first_word) < 2:
+            value = (value[0].upper() if sentence_start else value[0].lower()) + value[1:]
+        separator = ""
+        if self.before and not self.before[-1].isspace() and value[0] not in ".,!?…:;)]}»”\n":
+            separator = " "
+        return separator + value
+
+    def animate(self, value):
+        target = self.prepare(value)
+        if target == self.target:
+            return
+        self.composition_started = True
+        self.stop_animation()
+        self.target = target
+        common = 0
+        for left, right in zip(self.text, target):
+            if left != right:
+                break
+            common += 1
+        if common < len(self.text):
+            self.preview(target[:common])
+        remaining = len(target) - common
+        try:
+            character_ms = max(0, min(80, int(os.environ.get("GIGATYPE_LIVE_CHARACTER_MS", "12"))))
+        except ValueError:
+            character_ms = 12
+        if not remaining or not character_ms:
+            self.preview(target)
+            return
+        # Reveal one Unicode character at a time, catching up within ~400 ms.
+        delay = max(2, min(character_ms, 400 // remaining))
+
+        def step():
+            if not self.controller.valid():
+                self.animation = 0
+                return False
+            self.preview(self.target[:len(self.text) + 1])
+            if self.text == self.target:
+                self.animation = 0
+                return False
+            return True
+
+        self.animation = GLib.timeout_add(delay, step)
+
+    def clear(self):
+        self.stop_animation()
+        self.target = ""
+        self.preview("")
+
+    def begin_context(self):
+        self.clear()
+        self.composition_started = False
+        self.before = self.surrounding_before or ""
+        self.get_surrounding_text()
+
+    def do_set_surrounding_text(self, text, cursor_pos, anchor_pos):
+        value = text.get_text()
+        start = min(cursor_pos, anchor_pos, len(value))
+        self.surrounding_before = value[:start][-512:]
+        if self.controller.active and not self.composition_started:
+            self.before = self.surrounding_before
 
     def preview(self, value):
         self.text = value
+        if self.get_connection() is None:
+            return
         text = IBus.Text.new_from_string(value)
         text.append_attribute(IBus.AttrType.UNDERLINE, IBus.AttrUnderline.SINGLE, 0, len(value))
         self.update_preedit_text_with_mode(
@@ -34,6 +116,8 @@ class DictationEngine(IBus.Engine):
 
     def do_focus_in(self):
         self.focused = True
+        self.surrounding_before = None
+        self.get_surrounding_text()
         self.controller.engine = self
         if self.controller.active and not self.controller.same_context():
             self.controller.cancel()
@@ -104,7 +188,8 @@ class Controller:
         return bool(self.context and self.bus.current_input_context() == self.context)
 
     def valid(self):
-        return bool(self.active and self.engine and self.engine.focused and self.same_context())
+        return bool(self.active and self.engine and self.engine.get_connection()
+                    and self.engine.focused and self.same_context())
 
     def restore(self):
         previous, self.previous_engine = self.previous_engine, None
@@ -124,7 +209,7 @@ class Controller:
     def cancel(self):
         self.active = False
         if self.engine:
-            self.engine.preview("")
+            self.engine.clear()
         GLib.idle_add(self.restore)
 
     def handle(self, request, reply):
@@ -154,6 +239,7 @@ class Controller:
                                 self.cancel()
                                 reply({"ok": False, "error": "This field does not expose an IBus input context"})
                             else:
+                                self.engine.begin_context()
                                 reply({"ok": True})
                             return False
 
@@ -171,11 +257,14 @@ class Controller:
                     raise RuntimeError("The original text field is no longer focused")
                 value = request.get("text", "")
                 if op == "preview":
-                    self.engine.preview(value)
+                    self.engine.animate(value)
                 else:
-                    self.engine.preview("")
+                    value = self.engine.prepare(value)
+                    self.engine.composition_started = True
+                    self.engine.clear()
                     if value:
                         self.engine.commit_text(IBus.Text.new_from_string(value))
+                        self.engine.before = (self.engine.before + value)[-512:]
                 reply({"ok": True})
             elif op in {"cancel", "end", "shutdown"}:
                 self.cancel()
