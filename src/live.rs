@@ -181,8 +181,9 @@ impl Session {
         self.voice_end = audio.len();
     }
 
-    fn finish(&mut self, queue: &mut VecDeque<Request>, threshold: f32) -> Result<(), String> {
+    fn finish(&mut self, queue: &mut VecDeque<Request>, threshold: f32, bridge: &Bridge) -> Result<(), String> {
         let Some(recorder) = self.recorder.take() else { return Ok(()); };
+        let _ = bridge.request("indicator", "finishing");
         let audio = recorder.finish()?;
         self.scan(&audio, threshold);
         self.final_segment(&audio, queue);
@@ -307,7 +308,7 @@ pub fn daemon() -> Result<(), String> {
         }
         if let Some(session) = active.as_mut() {
             if session.recorder.is_some() && session.started.elapsed() >= maximum {
-                if let Err(error) = session.finish(&mut queue, threshold) {
+                if let Err(error) = session.finish(&mut queue, threshold, &bridge) {
                     close_session(&mut active, &mut queue, &bridge);
                     notify("Ошибка диктовки", &error);
                 }
@@ -369,7 +370,7 @@ pub fn daemon() -> Result<(), String> {
                         if session.started.elapsed() < Duration::from_millis(300) {
                             Ok("recording (live mode)".into())
                         } else {
-                            session.finish(&mut queue, threshold).map(|_| "transcribing (live mode)".into())
+                            session.finish(&mut queue, threshold, &bridge).map(|_| "transcribing (live mode)".into())
                         }
                     }
                     "cancel" => {

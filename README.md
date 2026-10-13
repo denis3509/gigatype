@@ -47,6 +47,11 @@ desktops keep the original record-then-insert mode. Requires `/usr/bin/python3`,
 
 - Focus a text field and press **F9**. An underlined draft appears while speaking
   and is revised as more audio arrives.
+- A small green **Диктовка** badge follows the text caret without taking focus or
+  receiving mouse clicks. When F9 stops recording, it turns amber and shows
+  **Обработка** until the final phrase is processed. It disappears on completion,
+  cancellation, or a focus change. If a client omits caret coordinates, it appears
+  near the mouse pointer instead. `GIGATYPE_LIVE_INDICATOR=0` hides the badge.
 - After a pause (1800 ms by default), the phrase is committed and dictation continues.
 - Press **F9** again to finish the final phrase, or **Shift+F9** to discard the
   current uncommitted phrase. Phrases already committed remain in the document.

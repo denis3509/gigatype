@@ -2,11 +2,13 @@
 """IBus composition bridge. Only the dictation's original input context is edited."""
 
 import json
+import math
 import os
 from pathlib import Path
 import signal
 import socket
 import threading
+import time
 
 import gi
 
@@ -15,6 +17,156 @@ from gi.repository import GLib, IBus
 
 ENGINE_NAME = "gigatype-live"
 IBus.init()
+
+
+class CaretIndicator:
+    """An unfocusable, click-through status badge anchored to the IBus caret."""
+
+    WIDTH = 146
+    HEIGHT = 30
+
+    def __init__(self):
+        self.window = None
+        self.rect = None
+        self.state = None
+        self.timer = 0
+        if os.environ.get("GIGATYPE_LIVE_INDICATOR") == "0":
+            return
+        try:
+            gi.require_version("Gtk", "3.0")
+            gi.require_version("Gdk", "3.0")
+            gi.require_foreign("cairo")
+            from gi.repository import Gtk, Gdk
+            import cairo
+            available, _args = Gtk.init_check([])
+            if not available:
+                return
+        except (ImportError, ValueError):
+            return
+        self.gdk = Gdk
+        self.cairo = cairo
+        self.window = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.window.set_title("GigaType dictation status")
+        self.window.set_decorated(False)
+        self.window.set_accept_focus(False)
+        self.window.set_focus_on_map(False)
+        self.window.set_keep_above(True)
+        self.window.set_skip_taskbar_hint(True)
+        self.window.set_skip_pager_hint(True)
+        self.window.set_resizable(False)
+        self.window.set_app_paintable(True)
+        self.window.set_type_hint(Gdk.WindowTypeHint.TOOLTIP)
+        visual = self.window.get_screen().get_rgba_visual()
+        if visual:
+            self.window.set_visual(visual)
+        self.area = Gtk.DrawingArea()
+        self.area.set_can_focus(False)
+        self.area.set_size_request(self.WIDTH, self.HEIGHT)
+        self.area.connect("draw", self.draw)
+        self.window.add(self.area)
+        self.window.connect("realize", self.click_through)
+
+    def click_through(self, window):
+        native = window.get_window()
+        if native:
+            native.set_accept_focus(False)
+            native.set_pass_through(True)
+            native.input_shape_combine_region(self.cairo.Region())
+
+    def place(self, rect):
+        self.rect = rect
+        if not self.window:
+            return
+        x, y, width, height = rect
+        display = self.window.get_display()
+        monitor = display.get_monitor_at_point(x, y)
+        if not monitor:
+            monitor = display.get_primary_monitor()
+        if not monitor:
+            return
+        bounds = monitor.get_workarea()
+        left = min(max(bounds.x + 4, x + max(0, width) + 8),
+                   bounds.x + bounds.width - self.WIDTH - 4)
+        top = y - self.HEIGHT - 7
+        if top < bounds.y + 4:
+            top = y + max(16, height) + 7
+        top = min(max(bounds.y + 4, top), bounds.y + bounds.height - self.HEIGHT - 4)
+        self.window.move(left, top)
+
+    def show(self, state, rect=None):
+        if not self.window:
+            return
+        self.state = state
+        if rect is not None:
+            self.place(rect)
+        elif self.rect is None:
+            # A few clients omit caret geometry; still show recording by the pointer.
+            pointer = self.window.get_display().get_default_seat().get_pointer()
+            _screen, x, y = pointer.get_position()
+            self.place((x, y, 0, 16))
+        self.window.show_all()
+        self.area.queue_draw()
+        if not self.timer:
+            self.timer = GLib.timeout_add(50, self.tick)
+
+    def hide(self):
+        self.state = None
+        self.rect = None
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = 0
+        if self.window:
+            self.window.hide()
+
+    def tick(self):
+        if not self.state or not self.window:
+            self.timer = 0
+            return False
+        self.area.queue_draw()
+        return True
+
+    def draw(self, _area, cr):
+        cr.set_operator(self.cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(self.cairo.OPERATOR_OVER)
+        radius = 12
+        for x, y, start in [(self.WIDTH - 2 - radius, 2 + radius, -math.pi / 2),
+                            (self.WIDTH - 2 - radius, self.HEIGHT - 2 - radius, 0),
+                            (2 + radius, self.HEIGHT - 2 - radius, math.pi / 2),
+                            (2 + radius, 2 + radius, math.pi)]:
+            cr.arc(x, y, radius, start, start + math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(0.08, 0.10, 0.14, 0.96)
+        cr.fill_preserve()
+        cr.set_line_width(1)
+        cr.set_source_rgba(0.38, 0.47, 0.59, 0.55)
+        cr.stroke()
+        processing = self.state == "finishing"
+        color = (1.0, 0.75, 0.33) if processing else (0.30, 0.88, 0.68)
+        phase = time.monotonic() * 4
+        if processing:
+            cr.set_line_width(2)
+            cr.arc(16, 15, 7, phase, phase + math.pi * 1.4)
+            cr.set_source_rgba(*color, 0.9)
+            cr.stroke()
+        else:
+            cr.arc(16, 15, 7 + math.sin(phase), 0, math.tau)
+            cr.set_source_rgba(*color, 0.16 + (math.sin(phase) + 1) * 0.06)
+            cr.fill()
+        cr.arc(16, 15, 4, 0, math.tau)
+        cr.set_source_rgba(*color, 1)
+        cr.fill()
+        cr.select_font_face("Sans", self.cairo.FONT_SLANT_NORMAL, self.cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(11)
+        cr.set_source_rgba(0.95, 0.97, 1, 1)
+        cr.move_to(29, 19)
+        cr.show_text("Обработка" if processing else "Диктовка")
+        cr.set_font_size(9)
+        cr.set_source_rgba(0.62, 0.70, 0.80, 1)
+        cr.move_to(123, 18)
+        cr.show_text("F9")
+        return False
 
 
 class DictationEngine(IBus.Engine):
@@ -28,6 +180,12 @@ class DictationEngine(IBus.Engine):
         self.before = ""
         self.surrounding_before = None
         self.composition_started = False
+        self.cursor_rect = None
+
+    def do_set_cursor_location(self, x, y, width, height):
+        self.cursor_rect = (x, y, width, height)
+        if self.controller.active and self.controller.engine is self:
+            self.controller.indicator.place(self.cursor_rect)
 
     def stop_animation(self):
         if self.animation:
@@ -159,6 +317,7 @@ class Controller:
         self.previous_engine = None
         self.context = None
         self.loop = GLib.MainLoop()
+        self.indicator = CaretIndicator()
         self.factory = IBus.Factory.new(self.bus.get_connection())
         self.factory.connect("create-engine", self.create_engine)
         self.bus.connect("disconnected", lambda *_: self.loop.quit())
@@ -208,6 +367,7 @@ class Controller:
 
     def cancel(self):
         self.active = False
+        self.indicator.hide()
         if self.engine:
             self.engine.clear()
         GLib.idle_add(self.restore)
@@ -240,6 +400,7 @@ class Controller:
                                 reply({"ok": False, "error": "This field does not expose an IBus input context"})
                             else:
                                 self.engine.begin_context()
+                                self.indicator.show("recording", self.engine.cursor_rect)
                                 reply({"ok": True})
                             return False
 
@@ -252,6 +413,14 @@ class Controller:
                 self.bus.set_global_engine_async(ENGINE_NAME, 1500, None, ready, None)
             elif op == "state":
                 reply({"ok": True, "active": self.valid()})
+            elif op == "indicator":
+                if not self.valid():
+                    raise RuntimeError("The original text field is no longer focused")
+                state = request.get("text", "recording")
+                if state not in {"recording", "finishing"}:
+                    raise RuntimeError("Unknown dictation indicator state")
+                self.indicator.show(state, self.engine.cursor_rect)
+                reply({"ok": True})
             elif op in {"preview", "commit"}:
                 if not self.valid():
                     raise RuntimeError("The original text field is no longer focused")
