@@ -85,6 +85,16 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Copy captured audio without interrupting the microphone stream.
+    pub fn snapshot(&self) -> Result<Vec<f32>, String> {
+        let interleaved = {
+            let (lock, _) = &*self.capture;
+            let state = lock.lock().map_err(|error| error.to_string())?;
+            state.chunks.iter().flat_map(|chunk| chunk.samples.iter().copied()).collect::<Vec<_>>()
+        };
+        Ok(resample_linear(&downmix(&interleaved, self.channels), self.input_rate, OUTPUT_RATE))
+    }
+
     pub fn start(preferred_device: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = if let Some(preferred) = preferred_device {
@@ -146,7 +156,11 @@ impl Recorder {
         })
     }
 
-    pub fn stop(mut self, output: &Path) -> Result<(), String> {
+    pub fn stop(self, output: &Path) -> Result<(), String> {
+        write_wav(output, &self.finish()?)
+    }
+
+    pub fn finish(mut self) -> Result<Vec<f32>, String> {
         let cutoff_host_time = Instant::now();
         let cutoff_nanos = {
             let (lock, ready) = &*self.capture;
@@ -204,7 +218,7 @@ impl Recorder {
             "GigaType microphone: {:.2}s, {} samples, peak {:.5}, RMS {:.5}",
             stats.duration_seconds, stats.sample_count, stats.peak, stats.rms
         );
-        write_wav(output, &samples)
+        Ok(samples)
     }
 }
 

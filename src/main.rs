@@ -1,5 +1,7 @@
 mod audio;
 mod model;
+#[cfg(target_os = "linux")]
+mod live;
 mod platform;
 #[cfg(target_os = "linux")]
 mod portal;
@@ -1609,6 +1611,14 @@ fn main() {
         return;
     }
     if args[0] == "daemon" {
+        #[cfg(target_os = "linux")]
+        if live::enabled() {
+            if let Err(error) = live::daemon() {
+                eprintln!("GigaType live: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         if let Err(error) = daemon() {
             eprintln!("GigaType: {error}");
             std::process::exit(1);

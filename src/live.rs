@@ -1,0 +1,377 @@
+//! Incremental GigaAM recognition with reversible IBus composition on GNOME.
+
+use super::{audio, dirs_home, model, notify, postprocess, runtime_dir, save_history,
+    socket_path, MediaGuard, SoundCue, SuspendDetector, play_sound};
+use std::collections::VecDeque;
+use std::env;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{Child, Command};
+use std::sync::{atomic::{AtomicBool, Ordering}, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const RATE: usize = 16_000;
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn stop_signal(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    match env::var("GIGATYPE_LIVE").as_deref() {
+        Ok("1") => true,
+        Ok("auto") => env::var("XDG_CURRENT_DESKTOP")
+            .is_ok_and(|value| value.to_ascii_lowercase().contains("gnome"))
+            && env::var_os("DISPLAY").is_some()
+            && env::var_os("WAYLAND_DISPLAY").is_none(),
+        _ => false,
+    }
+}
+
+struct Bridge {
+    process: Child,
+}
+
+impl Bridge {
+    fn start() -> Result<Self, String> {
+        let script = env::var_os("GIGATYPE_IBUS_BRIDGE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| dirs_home().join(".local/share/gigatype/live-ibus.py"));
+        let process = Command::new("/usr/bin/python3").arg(script).spawn()
+            .map_err(|error| format!("could not start IBus bridge: {error}"))?;
+        let mut bridge = Self { process };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if bridge.process.try_wait().map_err(|error| error.to_string())?.is_some() {
+                return Err("IBus bridge exited; install python3-gi and gir1.2-ibus-1.0".into());
+            }
+            if bridge.request("ping", "").is_ok() {
+                return Ok(bridge);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err("IBus bridge did not become ready".into())
+    }
+
+    fn request(&self, op: &str, text: &str) -> Result<serde_json::Value, String> {
+        let mut stream = UnixStream::connect(runtime_dir().join("gigatype-live-ibus.sock"))
+            .map_err(|error| format!("IBus bridge: {error}"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(|error| error.to_string())?;
+        stream.set_write_timeout(Some(Duration::from_secs(1))).map_err(|error| error.to_string())?;
+        writeln!(stream, "{}", serde_json::json!({"op": op, "text": text}))
+            .map_err(|error| error.to_string())?;
+        let mut response = String::new();
+        BufReader::new(stream).take(1024 * 1024).read_line(&mut response)
+            .map_err(|error| error.to_string())?;
+        let value: serde_json::Value = serde_json::from_str(&response).map_err(|error| error.to_string())?;
+        if value["ok"].as_bool() != Some(true) {
+            return Err(value["error"].as_str().unwrap_or("IBus composition failed").into());
+        }
+        Ok(value)
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        let _ = self.request("shutdown", "");
+        let deadline = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < deadline {
+            if self.process.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+struct Request {
+    session: u64,
+    segment: u64,
+    final_text: bool,
+    samples: Vec<f32>,
+}
+
+struct ResultText {
+    session: u64,
+    segment: u64,
+    final_text: bool,
+    text: Result<String, String>,
+}
+
+struct Session {
+    id: u64,
+    recorder: Option<audio::Recorder>,
+    media: Option<MediaGuard>,
+    started: Instant,
+    last_poll: Instant,
+    last_preview: Instant,
+    scanned: usize,
+    segment_start: usize,
+    segment: u64,
+    voice_samples: usize,
+    voice_end: usize,
+    pending_finals: usize,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(media) = self.media.take() { media.resume(); }
+    }
+}
+
+impl Session {
+    fn start(id: u64, bridge: &Bridge) -> Result<Self, String> {
+        bridge.request("begin", "")?;
+        let media = MediaGuard::pause_playing();
+        play_sound(SoundCue::Listening);
+        let preferred = env::var("GIGATYPE_MICROPHONE").ok();
+        let recorder = match audio::Recorder::start(preferred.as_deref()) {
+            Ok(recorder) => recorder,
+            Err(error) => {
+                media.resume();
+                let _ = bridge.request("cancel", "");
+                return Err(error);
+            }
+        };
+        let now = Instant::now();
+        notify("Диктовка", "Текст появляется во время речи. F9 — закончить; Shift+F9 — отменить фразу.");
+        Ok(Self { id, recorder: Some(recorder), media: Some(media), started: now,
+            last_poll: now, last_preview: now, scanned: 0, segment_start: 0,
+            segment: 0, voice_samples: 0, voice_end: 0, pending_finals: 0 })
+    }
+
+    fn scan(&mut self, audio: &[f32], threshold: f32) {
+        // Scan every captured frame, including frames arriving during inference.
+        let from = self.scanned.min(audio.len());
+        for (index, frame) in audio[from..].chunks(RATE / 50).enumerate() {
+            let rms = (frame.iter().map(|sample| sample * sample).sum::<f32>()
+                / frame.len().max(1) as f32).sqrt();
+            let peak = frame.iter().map(|sample| sample.abs()).fold(0.0_f32, f32::max);
+            if rms >= threshold && peak >= threshold * 2.0 {
+                let start = from + index * (RATE / 50);
+                if self.voice_samples == 0 {
+                    self.segment_start = self.segment_start.max(start.saturating_sub(RATE / 5));
+                }
+                self.voice_samples += frame.len();
+                self.voice_end = start + frame.len();
+            }
+        }
+        self.scanned = audio.len();
+    }
+
+    fn final_segment(&mut self, audio: &[f32], queue: &mut VecDeque<Request>) {
+        if self.voice_samples >= RATE / 12 {
+            let end = audio.len().min(self.voice_end + RATE / 4);
+            if end > self.segment_start {
+                queue.push_back(Request { session: self.id, segment: self.segment,
+                    final_text: true, samples: audio[self.segment_start..end].to_vec() });
+                self.pending_finals += 1;
+            }
+        }
+        self.segment += 1;
+        self.segment_start = audio.len();
+        self.voice_samples = 0;
+        self.voice_end = audio.len();
+    }
+
+    fn finish(&mut self, queue: &mut VecDeque<Request>, threshold: f32) -> Result<(), String> {
+        let Some(recorder) = self.recorder.take() else { return Ok(()); };
+        let audio = recorder.finish()?;
+        self.scan(&audio, threshold);
+        self.final_segment(&audio, queue);
+        if let Some(media) = self.media.take() { media.resume(); }
+        Ok(())
+    }
+}
+
+fn close_session(active: &mut Option<Session>, queue: &mut VecDeque<Request>, bridge: &Bridge) {
+    active.take();
+    queue.clear();
+    let _ = bridge.request("end", "");
+}
+
+pub fn daemon() -> Result<(), String> {
+    std::fs::create_dir_all(runtime_dir()).map_err(|error| error.to_string())?;
+    let _ = std::fs::remove_file(super::transcribing_path());
+    let bridge = Bridge::start()?;
+    let path = socket_path();
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).map_err(|error| error.to_string())?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    listener.set_nonblocking(true).map_err(|error| error.to_string())?;
+    let model = model::GigaAm::load_default()?;
+    let (requests, incoming) = mpsc::channel::<Request>();
+    let (outgoing, results) = mpsc::channel::<ResultText>();
+    thread::spawn(move || {
+        let mut model = model;
+        while let Ok(mut job) = incoming.recv() {
+            job.samples.resize(job.samples.len() + RATE / 4, 0.0);
+            let started = Instant::now();
+            let text = model.transcribe_samples(&job.samples);
+            eprintln!("GigaType live: {} recognition in {:.2}s", if job.final_text { "final" } else { "partial" }, started.elapsed().as_secs_f64());
+            if outgoing.send(ResultText { session: job.session, segment: job.segment,
+                final_text: job.final_text, text }).is_err() { break; }
+        }
+    });
+    let _shortcuts = super::shortcuts::ShortcutManager::start()
+        .ok_or_else(|| "could not register F9/Shift+F9 in the X11 session".to_string())?;
+    let mut active: Option<Session> = None;
+    let mut queue = VecDeque::new();
+    let mut busy = false;
+    let mut next_id = 0;
+    let mut suspend = SuspendDetector::new();
+    let mut checked_focus = Instant::now();
+    let interval = Duration::from_millis(env_u64("GIGATYPE_LIVE_INTERVAL_MS", 900).clamp(250, 5000));
+    let pause = env_u64("GIGATYPE_LIVE_PAUSE_MS", 800).clamp(300, 3000) as usize * RATE / 1000;
+    let maximum = Duration::from_millis(env_u64("GIGATYPE_MAX_RECORDING_MS", 120_000).max(1000));
+    let threshold = env::var("GIGATYPE_LIVE_SILENCE_RMS").ok()
+        .and_then(|value| value.parse::<f32>().ok()).filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(80.0 / 32768.0);
+    STOP.store(false, Ordering::Relaxed);
+    unsafe {
+        libc::signal(libc::SIGTERM, stop_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, stop_signal as *const () as libc::sighandler_t);
+    }
+    eprintln!("GigaType live: ready; IBus inline composition, F9 start/stop, Shift+F9 cancel");
+
+    while !STOP.load(Ordering::Relaxed) {
+        if suspend.resumed() && active.is_some() {
+            close_session(&mut active, &mut queue, &bridge);
+        }
+        if active.is_some() && checked_focus.elapsed() >= Duration::from_millis(200) {
+            checked_focus = Instant::now();
+            if !bridge.request("state", "").ok().is_some_and(|value| value["active"] == true) {
+                close_session(&mut active, &mut queue, &bridge);
+                notify("Диктовка остановлена", "Поле ввода изменилось или начат ручной ввод.");
+            }
+        }
+        while let Ok(result) = results.try_recv() {
+            busy = false;
+            let Some(session) = active.as_mut().filter(|session| session.id == result.session) else { continue; };
+            if !result.final_text && (session.segment != result.segment || session.recorder.is_none()) { continue; }
+            let outcome = result.text.and_then(|text| {
+                let text = if result.final_text { postprocess(&text) } else {
+                    super::capitalize_first(&text.split_whitespace().collect::<Vec<_>>().join(" "))
+                };
+                if result.final_text {
+                    session.pending_finals = session.pending_finals.saturating_sub(1);
+                    if !text.is_empty() {
+                        bridge.request("commit", &format!("{text} "))?;
+                        save_history(&text)?;
+                    }
+                } else if !text.is_empty() {
+                    bridge.request("preview", &text)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = outcome {
+                close_session(&mut active, &mut queue, &bridge);
+                notify("Ошибка диктовки", &error);
+            }
+        }
+        if active.as_ref().is_some_and(|session| session.recorder.is_none() && session.pending_finals == 0) {
+            close_session(&mut active, &mut queue, &bridge);
+            play_sound(SoundCue::Transcribing);
+        }
+        if let Some(session) = active.as_mut() {
+            if session.recorder.is_some() && session.started.elapsed() >= maximum {
+                if let Err(error) = session.finish(&mut queue, threshold) {
+                    close_session(&mut active, &mut queue, &bridge);
+                    notify("Ошибка диктовки", &error);
+                }
+            }
+        }
+        if let Some(session) = active.as_mut() {
+            if let Some(recorder) = session.recorder.as_ref().filter(|_| session.last_poll.elapsed() >= Duration::from_millis(120)) {
+                let snapshot = recorder.snapshot();
+                session.last_poll = Instant::now();
+                match snapshot {
+                    Ok(audio) => {
+                        session.scan(&audio, threshold);
+                        if session.voice_samples > 0 && (audio.len().saturating_sub(session.voice_end) >= pause
+                            || audio.len().saturating_sub(session.segment_start) >= RATE * 18) {
+                            session.final_segment(&audio, &mut queue);
+                        } else if !busy && queue.is_empty() && session.pending_finals == 0
+                            && session.voice_samples >= RATE / 5 && session.last_preview.elapsed() >= interval {
+                            session.last_preview = Instant::now();
+                            requests.send(Request { session: session.id, segment: session.segment,
+                                final_text: false, samples: audio[session.segment_start..].to_vec() })
+                                .map_err(|error| error.to_string())?;
+                            busy = true;
+                        }
+                    }
+                    Err(error) => {
+                        close_session(&mut active, &mut queue, &bridge);
+                        notify("Ошибка микрофона", &error);
+                    }
+                }
+            }
+        }
+        if !busy {
+            if let Some(job) = queue.pop_front() {
+                requests.send(job).map_err(|error| error.to_string())?;
+                busy = true;
+            }
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+                let mut command = String::new();
+                if BufReader::new(&stream).take(128).read_line(&mut command).is_err() { continue; }
+                let response: Result<String, String> = match command.trim() {
+                    "status" => Ok(match &active {
+                        None => "idle (live mode)",
+                        Some(session) if session.recorder.is_some() => "recording (live mode)",
+                        Some(_) => "transcribing (live mode)",
+                    }.into()),
+                    "toggle" if active.is_none() => {
+                        next_id += 1;
+                        Session::start(next_id, &bridge).map(|session| {
+                            active = Some(session);
+                            "recording (live mode)".into()
+                        })
+                    }
+                    "toggle" => {
+                        let session = active.as_mut().unwrap();
+                        if session.started.elapsed() < Duration::from_millis(300) {
+                            Ok("recording (live mode)".into())
+                        } else {
+                            session.finish(&mut queue, threshold).map(|_| "transcribing (live mode)".into())
+                        }
+                    }
+                    "cancel" => {
+                        close_session(&mut active, &mut queue, &bridge);
+                        Ok("cancelled".into())
+                    }
+                    "quit" => {
+                        writeln!(stream, "bye").ok();
+                        break;
+                    }
+                    _ => Err("unknown command".into()),
+                };
+                match response {
+                    Ok(message) => { writeln!(stream, "{message}").ok(); }
+                    Err(error) => {
+                        close_session(&mut active, &mut queue, &bridge);
+                        notify("Ошибка диктовки", &error);
+                        writeln!(stream, "error: {error}").ok();
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    close_session(&mut active, &mut queue, &bridge);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
+}

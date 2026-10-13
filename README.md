@@ -38,6 +38,37 @@ gigatype authorize
 
 On macOS, allow GigaType access to the microphone and Accessibility controls when prompted. Wayland permission is handled by `gigatype authorize` and the installer.
 
+## Live dictation on GNOME/X11
+
+The `codex/live-dictation` branch adds inline, revisable dictation through IBus.
+The installed systemd service enables it automatically on GNOME/X11. Other
+desktops keep the original record-then-insert mode. Requires `/usr/bin/python3`,
+`python3-gi`, `gir1.2-ibus-1.0`, a running IBus session, and an IBus-aware text field.
+
+- Focus a text field and press **F9**. An underlined draft appears while speaking
+  and is revised as more audio arrives.
+- After a pause (800 ms by default), the phrase is committed and dictation continues.
+- Press **F9** again to finish the final phrase, or **Shift+F9** to discard the
+  current uncommitted phrase. Phrases already committed remain in the document.
+- Changing the input context, typing manually, or moving the cursor stops dictation
+  and clears the uncommitted draft. The previous keyboard engine is restored.
+- Apps that do not expose an IBus input context cannot use this mode. Set
+  `GIGATYPE_LIVE=0` in a systemd user override to use the original clipboard mode.
+
+This uses repeated recognition of the accumulated phrase with the existing local
+GigaAM v3 ONNX model, rather than a native streaming encoder. Updates are requested
+every 900 ms; actual latency also includes inference time. Long continuous speech
+is split after 18 seconds to bound the amount reprocessed. Final phrases are saved
+in the existing transcript history; intermediate drafts are not saved.
+
+Optional service environment settings: `GIGATYPE_LIVE_INTERVAL_MS` (250–5000 ms),
+`GIGATYPE_LIVE_PAUSE_MS` (300–3000 ms), and `GIGATYPE_LIVE_SILENCE_RMS` (positive
+normalized microphone RMS, default `80/32768`). Microphone selection still uses
+`GIGATYPE_MICROPHONE`. Explicitly set `GIGATYPE_LIVE=1` to request live mode;
+`auto` selects it only on GNOME/X11.
+The existing 120-second session limit is retained; `GIGATYPE_MAX_RECORDING_MS`
+can change it. At the limit, the last phrase is finalized automatically.
+
 ## Local data
 
 - Model: `~/.local/share/gigatype/models/`

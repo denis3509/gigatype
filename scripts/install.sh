@@ -55,6 +55,16 @@ ensure_modern_rust() {
 
 install_build_dependencies
 ensure_modern_rust
+if [[ "$(uname -s)" == Linux && "${XDG_CURRENT_DESKTOP,,}" == *gnome* && -z "${WAYLAND_DISPLAY:-}" ]]; then
+  if ! /usr/bin/python3 -c 'import gi; gi.require_version("IBus", "1.0"); from gi.repository import IBus' 2>/dev/null; then
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get install -y python3-gi gir1.2-ibus-1.0
+    else
+      echo "Install Python 3, PyGObject and the IBus 1.0 introspection bindings for live dictation." >&2
+      exit 1
+    fi
+  fi
+fi
 "$ROOT/scripts/bootstrap-model.sh"
 
 cd "$ROOT"
@@ -62,6 +72,7 @@ cargo build --locked --release
 
 install -d "$BIN_DIR" "$DATA_DIR" "$APP_DIR"
 install -m 0755 target/release/gigatype "$BIN_DIR/gigatype"
+install -m 0644 scripts/live-ibus.py "$DATA_DIR/live-ibus.py"
 [[ -f "$DATA_DIR/history.jsonl" ]] && chmod 0600 "$DATA_DIR/history.jsonl"
 
 rm -f "$APP_DIR/io.github.gigatype.desktop" "$APP_DIR/io.github.gigatype.cancel.desktop"

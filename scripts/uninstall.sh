@@ -17,6 +17,7 @@ rm -f "${HOME}/.local/bin/gigatype"
 rm -f "${HOME}/.local/share/gigatype/history.jsonl"
 rm -f "${HOME}/.local/share/gigatype/daemon.log"
 rm -f "${HOME}/.local/share/gigatype/portal-input-token"
+rm -f "${HOME}/.local/share/gigatype/live-ibus.py"
 
 if [[ -f /etc/udev/rules.d/99-gigatype-uinput.rules ]] && command -v sudo >/dev/null 2>&1; then
   sudo rm -f /etc/udev/rules.d/99-gigatype-uinput.rules
