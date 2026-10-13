@@ -72,7 +72,8 @@ high-scoring hypothesis may still be wrong.
 
 The confirmed draft is revealed one Unicode character at a time with a default
 12 ms interval, speeding up for long additions. Corrections preserve the common
-prefix. This is presentation smoothing of available hypotheses, not a new streaming
+prefix. A correction or shortened hypothesis replaces the displayed draft in one
+update; only a newly added suffix is animated. This is presentation smoothing of available hypotheses, not a new streaming
 speech model. `GIGATYPE_LIVE_CHARACTER_MS=0` disables the animation.
 
 Where the app supplies IBus surrounding text, the preceding 512 characters are

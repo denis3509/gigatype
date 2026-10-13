@@ -71,13 +71,17 @@ class CaretIndicator:
         if native:
             native.set_accept_focus(False)
             native.set_pass_through(True)
-            native.input_shape_combine_region(self.cairo.Region())
+            native.input_shape_combine_region(self.cairo.Region(), 0, 0)
 
-    def place(self, rect):
+    def place(self, rect, physical=True):
         self.rect = rect
         if not self.window:
             return
         x, y, width, height = rect
+        if physical:
+            # IBus uses X11 root pixels; GTK window positions use logical pixels.
+            scale = max(1, self.window.get_scale_factor())
+            x, y, width, height = (round(value / scale) for value in rect)
         display = self.window.get_display()
         monitor = display.get_monitor_at_point(x, y)
         if not monitor:
@@ -103,8 +107,11 @@ class CaretIndicator:
             # A few clients omit caret geometry; still show recording by the pointer.
             pointer = self.window.get_display().get_default_seat().get_pointer()
             _screen, x, y = pointer.get_position()
-            self.place((x, y, 0, 16))
+            self.place((x, y, 0, 16), physical=False)
         self.window.show_all()
+        native = self.window.get_window()
+        if native:
+            native.raise_()
         self.area.queue_draw()
         if not self.timer:
             self.timer = GLib.timeout_add(50, self.tick)
@@ -161,7 +168,7 @@ class CaretIndicator:
         cr.set_font_size(11)
         cr.set_source_rgba(0.95, 0.97, 1, 1)
         cr.move_to(29, 19)
-        cr.show_text("Обработка" if processing else "Диктовка")
+        cr.show_text("Индикатор" if self.state == "preview" else "Обработка" if processing else "Диктовка")
         cr.set_font_size(9)
         cr.set_source_rgba(0.62, 0.70, 0.80, 1)
         cr.move_to(123, 18)
@@ -213,7 +220,12 @@ class DictationEngine(IBus.Engine):
             return
         self.composition_started = True
         self.stop_animation()
+        correction = not target.startswith(self.text) or (self.target and not target.startswith(self.target))
         self.target = target
+        if correction:
+            # Replace a revised hypothesis atomically; only new suffixes animate.
+            self.preview(target)
+            return
         common = 0
         for left, right in zip(self.text, target):
             if left != right:
@@ -376,6 +388,26 @@ class Controller:
         try:
             op = request["op"]
             if op == "ping":
+                reply({"ok": True,
+                       "indicator_enabled": self.indicator.window is not None,
+                       "indicator_visible": bool(self.indicator.window and self.indicator.window.get_visible()),
+                       "indicator_position": self.indicator.window.get_position() if self.indicator.window else None,
+                       "caret": self.engine.cursor_rect if self.engine else None})
+            elif op == "preview-indicator":
+                if self.active or self.switching:
+                    raise RuntimeError("Cannot preview the indicator during dictation")
+                self.indicator.show("preview")
+
+                def hide_preview():
+                    if self.indicator.state == "preview":
+                        self.indicator.hide()
+                    return False
+
+                GLib.timeout_add(15000, hide_preview)
+                reply({"ok": True, "visible": bool(self.indicator.window and self.indicator.window.get_visible())})
+            elif op == "hide-preview":
+                if self.indicator.state == "preview":
+                    self.indicator.hide()
                 reply({"ok": True})
             elif op == "begin":
                 if self.active or self.switching:
