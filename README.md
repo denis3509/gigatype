@@ -1,15 +1,17 @@
-# GigaType
+# GigaType — vibe-coded fork
 
-[![CI](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml/badge.svg)](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml)
+[![Upstream CI](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml/badge.svg)](https://github.com/kpoxo6op/gigatype/actions/workflows/ci.yml)
+
+This is a **vibe-coded fork** of [kpoxo6op/gigatype](https://github.com/kpoxo6op/gigatype), developed iteratively with Codex. It adds live, revisable Russian dictation through IBus on GNOME/X11, confidence-filtered previews, context-aware spacing and casing, character-by-character additions, immediate corrections, and a status indicator beside the caret. The original project and its Git history are preserved.
 
 GigaType is local Russian voice typing for Unix desktops. Press `F9`, speak, then press `F9` again to insert the transcription into the focused app.
 
-It runs [GigaAM v3](https://huggingface.co/ai-sage/GigaAM-v3) on your computer. Dictation does not use a cloud API, account, token, or Python runtime.
+It runs [GigaAM v3](https://huggingface.co/ai-sage/GigaAM-v3) on your computer. Speech recognition runs locally in Rust without a cloud API, account, or token. The GNOME live-dictation interface uses a small Python IBus/GTK bridge.
 
 ## Install
 
 ```bash
-git clone https://github.com/kpoxo6op/gigatype.git
+git clone https://github.com/denis3509/gigatype.git
 cd gigatype
 ./scripts/install.sh
 ```
