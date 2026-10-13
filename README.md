@@ -102,6 +102,55 @@ Preview tuning: `GIGATYPE_LIVE_INITIAL_MS` (300–5000, default 1200),
 threshold delay more uncertain drafts; lowering them makes previews faster and
 more prone to revisions. Settings can be added to a systemd user service override.
 
+## Scripts and startup on GNOME/X11
+
+| File | Role |
+| --- | --- |
+| [`scripts/install.sh`](scripts/install.sh) | Installs dependencies, downloads and verifies the model, builds the Rust app, installs the Python bridge, and enables the user service. |
+| [`scripts/bootstrap-model.sh`](scripts/bootstrap-model.sh) | Downloads the GigaAM ONNX files and checks their SHA-256 hashes. |
+| [`scripts/live-ibus.py`](scripts/live-ibus.py) | The fork's Python IBus/GTK bridge: displays and revises inline drafts, applies immediate corrections, reads surrounding text for spacing/case, and draws the caret status badge. |
+| [`scripts/uninstall.sh`](scripts/uninstall.sh) | Removes the installed app and service while retaining the downloaded model. |
+
+The installer copies `scripts/live-ibus.py` to
+`~/.local/share/gigatype/live-ibus.py`. The `gigatype daemon` process launches this
+installed copy automatically with `/usr/bin/python3` when live mode is enabled.
+Speech recognition and confidence filtering run in Rust in `src/model.rs` and
+`src/live.rs`; the Python script handles the desktop input and indicator.
+
+The bridge requires PyGObject and IBus 1.0 bindings. The badge additionally uses
+GTK 3 and Cairo. On Ubuntu/Debian the installer checks these packages:
+`python3-gi`, `python3-gi-cairo`, `python3-cairo`, `gir1.2-ibus-1.0`, and
+`gir1.2-gtk-3.0`.
+
+To install or update the bridge from this checkout, run `./scripts/install.sh`.
+The installer also restarts the service, so finish any active dictation first.
+Developers can set `GIGATYPE_IBUS_BRIDGE` to an alternative script path in the
+service environment.
+
+Inspect the running service and its logs:
+
+```bash
+systemctl --user status gigatype.service
+journalctl --user -u gigatype.service -n 50 --no-pager
+```
+
+To customize the documented settings, run
+`systemctl --user edit gigatype.service` and add an override, for example:
+
+```ini
+[Service]
+Environment=GIGATYPE_LIVE_MIN_CONFIDENCE=0.55
+Environment=GIGATYPE_LIVE_CHARACTER_MS=12
+Environment=GIGATYPE_LIVE_INDICATOR=1
+```
+
+After saving the override and finishing any active dictation:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart gigatype.service
+```
+
 ## Local data
 
 - Model: `~/.local/share/gigatype/models/`
