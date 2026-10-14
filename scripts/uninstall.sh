@@ -4,6 +4,7 @@ set -euo pipefail
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user disable --now gigatype.service 2>/dev/null || true
   rm -f "${HOME}/.config/systemd/user/gigatype.service"
+  rm -f "${HOME}/.config/systemd/user/gigatype.service.d/diagnostics.conf"
   systemctl --user daemon-reload
 fi
 if command -v launchctl >/dev/null 2>&1; then
@@ -18,6 +19,7 @@ rm -f "${HOME}/.local/share/gigatype/history.jsonl"
 rm -f "${HOME}/.local/share/gigatype/daemon.log"
 rm -f "${HOME}/.local/share/gigatype/portal-input-token"
 rm -f "${HOME}/.local/share/gigatype/live-ibus.py"
+rm -f "${HOME}/.local/share/gigatype/run-with-logs.py"
 
 if [[ -f /etc/udev/rules.d/99-gigatype-uinput.rules ]] && command -v sudo >/dev/null 2>&1; then
   sudo rm -f /etc/udev/rules.d/99-gigatype-uinput.rules

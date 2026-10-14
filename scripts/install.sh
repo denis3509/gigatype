@@ -73,6 +73,7 @@ cargo build --locked --release
 install -d "$BIN_DIR" "$DATA_DIR" "$APP_DIR"
 install -m 0755 target/release/gigatype "$BIN_DIR/gigatype"
 install -m 0644 scripts/live-ibus.py "$DATA_DIR/live-ibus.py"
+install -m 0644 scripts/run-with-logs.py "$DATA_DIR/run-with-logs.py"
 [[ -f "$DATA_DIR/history.jsonl" ]] && chmod 0600 "$DATA_DIR/history.jsonl"
 
 rm -f "$APP_DIR/io.github.gigatype.desktop" "$APP_DIR/io.github.gigatype.cancel.desktop"

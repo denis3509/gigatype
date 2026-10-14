@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import sys
 import threading
 import time
 
@@ -17,6 +18,11 @@ from gi.repository import GLib, IBus
 
 ENGINE_NAME = "gigatype-live"
 IBus.init()
+
+
+def diagnostic(event, **fields):
+    # Never record recognition text, surrounding text, or key values.
+    print(json.dumps({"component": "ibus", "event": event, **fields}), file=sys.stderr, flush=True)
 
 
 class CaretIndicator:
@@ -285,26 +291,30 @@ class DictationEngine(IBus.Engine):
         )
 
     def do_focus_in(self):
+        diagnostic("focus_in", engine_number=self.controller.engine_count, active=self.controller.active)
         self.focused = True
         self.surrounding_before = None
         self.get_surrounding_text()
         self.controller.engine = self
         if self.controller.active and not self.controller.same_context():
-            self.controller.cancel()
+            self.controller.cancel("context_changed_on_focus_in")
 
     def do_focus_out(self):
+        diagnostic("focus_out", active=self.controller.active)
         self.focused = False
         if self.controller.active:
-            self.controller.cancel()
+            self.controller.cancel("focus_out")
 
     def do_reset(self):
+        diagnostic("reset", active=self.controller.active)
         if self.controller.active:
-            self.controller.cancel()
+            self.controller.cancel("ibus_reset")
 
     def do_disable(self):
+        diagnostic("disable", active=self.controller.active)
         self.focused = False
         if self.controller.active:
-            self.controller.cancel()
+            self.controller.cancel("engine_disabled")
 
     def do_process_key_event(self, keyval, keycode, state):
         # Let ordinary keyboard input through, but stop revising dictation first.
@@ -313,7 +323,7 @@ class DictationEngine(IBus.Engine):
                      IBus.KEY_Super_L, IBus.KEY_Super_R, IBus.KEY_F9}
         if not state & IBus.ModifierType.RELEASE_MASK and keyval not in modifiers:
             if self.controller.active:
-                self.controller.cancel()
+                self.controller.cancel("keyboard_input")
         return False
 
 
@@ -324,6 +334,7 @@ class Controller:
             raise RuntimeError("IBus is not connected to the desktop session")
         self.engine = None
         self.engine_count = 0
+        self.session = 0
         self.active = False
         self.switching = False
         self.previous_engine = None
@@ -349,6 +360,7 @@ class Controller:
         if name != ENGINE_NAME:
             raise RuntimeError(f"Unknown engine {name}")
         self.engine_count += 1
+        diagnostic("engine_created", engine_number=self.engine_count)
         self.engine = DictationEngine(
             self, connection=self.bus.get_connection(),
             object_path=f"/org/freedesktop/IBus/GigaTypeLive/Engine{self.engine_count}"
@@ -370,14 +382,18 @@ class Controller:
 
             def restored(bus, result, _data):
                 try:
-                    bus.set_global_engine_async_finish(result)
+                    ok = bus.set_global_engine_async_finish(result)
+                    diagnostic("engine_restored", session=self.session, ok=bool(ok))
                 finally:
                     self.switching = False
 
             self.bus.set_global_engine_async(previous, 1000, None, restored, None)
         return False
 
-    def cancel(self):
+    def cancel(self, reason="unspecified"):
+        diagnostic("cancel", session=self.session, reason=reason, active=self.active,
+                   focused=bool(self.engine and self.engine.focused),
+                   draft_chars=len(self.engine.text) if self.engine else 0)
         self.active = False
         self.indicator.hide()
         if self.engine:
@@ -412,7 +428,9 @@ class Controller:
             elif op == "begin":
                 if self.active or self.switching:
                     raise RuntimeError("A dictation session is already active")
+                self.session = request.get("session") or self.session + 1
                 self.context = self.bus.current_input_context()
+                diagnostic("begin", session=self.session, context=self.context)
                 if not self.context:
                     raise RuntimeError("Focus a text field before starting dictation")
                 current = self.bus.get_global_engine()
@@ -428,9 +446,10 @@ class Controller:
                             self.switching = False
                             self.active = bool(self.engine and self.engine.focused and self.same_context())
                             if not self.active:
-                                self.cancel()
+                                self.cancel("activation_no_focus")
                                 reply({"ok": False, "error": "This field does not expose an IBus input context"})
                             else:
+                                diagnostic("activated", session=self.session, context=self.context)
                                 self.engine.begin_context()
                                 self.indicator.show("recording", self.engine.cursor_rect)
                                 reply({"ok": True})
@@ -439,12 +458,18 @@ class Controller:
                         GLib.timeout_add(100, focused)
                     except Exception as exc:
                         self.switching = False
-                        self.cancel()
+                        diagnostic("activation_error", session=self.session, error=str(exc))
+                        self.cancel("activation_error")
                         reply({"ok": False, "error": str(exc)})
 
                 self.bus.set_global_engine_async(ENGINE_NAME, 1500, None, ready, None)
             elif op == "state":
-                reply({"ok": True, "active": self.valid()})
+                valid = self.valid()
+                if self.active and not valid:
+                    diagnostic("invalid_context", session=self.session,
+                               expected=self.context, current=self.bus.current_input_context(),
+                               focused=bool(self.engine and self.engine.focused))
+                reply({"ok": True, "active": valid})
             elif op == "indicator":
                 if not self.valid():
                     raise RuntimeError("The original text field is no longer focused")
@@ -458,23 +483,27 @@ class Controller:
                     raise RuntimeError("The original text field is no longer focused")
                 value = request.get("text", "")
                 if op == "preview":
+                    diagnostic("preview", session=self.session, chars=len(value), shown_chars=len(self.engine.text))
                     self.engine.animate(value)
                 else:
                     value = self.engine.prepare(value)
+                    diagnostic("commit_requested", session=self.session, chars=len(value), draft_chars=len(self.engine.text))
                     self.engine.composition_started = True
                     self.engine.clear()
                     if value:
                         self.engine.commit_text(IBus.Text.new_from_string(value))
                         self.engine.before = (self.engine.before + value)[-512:]
+                        diagnostic("commit_dispatched", session=self.session, chars=len(value), application_ack=False)
                 reply({"ok": True})
             elif op in {"cancel", "end", "shutdown"}:
-                self.cancel()
+                self.cancel("request_" + op)
                 reply({"ok": True})
                 if op == "shutdown":
                     GLib.timeout_add(250, lambda: (self.loop.quit(), False)[1])
             else:
                 raise RuntimeError(f"Unknown operation {op}")
         except Exception as exc:
+            diagnostic("request_error", session=self.session, op=request.get("op"), error=str(exc))
             reply({"ok": False, "error": str(exc)})
         return False
 
@@ -509,8 +538,10 @@ def main():
             GLib.idle_add(controller.handle, request, reply)
             if event.wait(4):
                 conn.sendall((json.dumps(response[0], ensure_ascii=False) + "\n").encode())
-        except (OSError, ValueError):
-            pass
+            else:
+                diagnostic("request_timeout", op=request.get("op"))
+        except (OSError, ValueError) as exc:
+            diagnostic("connection_error", error=str(exc))
         finally:
             conn.close()
 

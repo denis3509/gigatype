@@ -112,6 +112,7 @@ more prone to revisions. Settings can be added to a systemd user service overrid
 | [`scripts/install.sh`](scripts/install.sh) | Installs dependencies, downloads and verifies the model, builds the Rust app, installs the Python bridge, and enables the user service. |
 | [`scripts/bootstrap-model.sh`](scripts/bootstrap-model.sh) | Downloads the GigaAM ONNX files and checks their SHA-256 hashes. |
 | [`scripts/live-ibus.py`](scripts/live-ibus.py) | The fork's Python IBus/GTK bridge: displays and revises inline drafts, applies immediate corrections, reads surrounding text for spacing/case, and draws the caret status badge. |
+| [`scripts/run-with-logs.py`](scripts/run-with-logs.py) | Optional Python 3 service wrapper that timestamps daemon and bridge output and rotates up to 100 MB of diagnostics. |
 | [`scripts/uninstall.sh`](scripts/uninstall.sh) | Removes the installed app and service while retaining the downloaded model. |
 
 The installer copies `scripts/live-ibus.py` to
@@ -153,6 +154,48 @@ After saving the override and finishing any active dictation:
 systemctl --user daemon-reload
 systemctl --user restart gigatype.service
 ```
+
+## Diagnostic log files
+
+For GNOME/X11 troubleshooting, the daemon records session/segment IDs, recognition
+latency and character counts, preview retention, pause boundaries, final-result
+submission, history-save status, and session termination reasons. The IBus bridge
+records activation, focus changes, resets, keyboard-triggered cancellation,
+request errors/timeouts, and commit dispatch. Session IDs restart with the daemon;
+use the timestamp and startup PID to distinguish service runs.
+
+`commit_dispatched` / `commit_bridge_accepted` mean the insertion signal was sent,
+**not that the target application acknowledged inserting it**. No recognized text,
+surrounding text, audio, or individual key values are added to these diagnostics.
+The existing transcript history is separate and is not covered by this log budget.
+
+To retain diagnostics inside the checkout, install/update the project, then create
+`~/.config/systemd/user/gigatype.service.d/diagnostics.conf` (create the directory
+if necessary) with the following contents. Adjust the checkout path if needed:
+
+```ini
+[Service]
+Environment=GIGATYPE_LOG_DIR=%h/Programs/gigatype/logs
+ExecStart=
+ExecStart=/usr/bin/python3 %h/.local/share/gigatype/run-with-logs.py %h/.local/bin/gigatype daemon
+```
+
+Finish dictation, run `systemctl --user daemon-reload`, then
+`systemctl --user restart gigatype.service`. The wrapper writes UTC timestamps to
+`logs/gigatype.log` and keeps up to nine older files (`gigatype.log.1` is newest).
+Each file is limited to 10,000,000 bytes: at most **100,000,000 bytes total**.
+Oldest files are deleted automatically. Logs are owner-readable/writable and
+`logs/` is ignored by Git. Output also remains available through the system journal,
+whose retention is managed separately by systemd.
+
+From the checkout, follow the current file across rotation:
+
+```bash
+tail -F logs/gigatype.log
+```
+
+Remove only `diagnostics.conf`, reload systemd, and restart the service to disable
+file logging. Uninstallation removes this override but retains the project logs.
 
 ## Local data
 

@@ -56,11 +56,15 @@ impl Bridge {
     }
 
     fn request(&self, op: &str, text: &str) -> Result<serde_json::Value, String> {
+        self.request_for_session(op, text, None)
+    }
+
+    fn request_for_session(&self, op: &str, text: &str, session: Option<u64>) -> Result<serde_json::Value, String> {
         let mut stream = UnixStream::connect(runtime_dir().join("gigatype-live-ibus.sock"))
             .map_err(|error| format!("IBus bridge: {error}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(|error| error.to_string())?;
         stream.set_write_timeout(Some(Duration::from_secs(1))).map_err(|error| error.to_string())?;
-        writeln!(stream, "{}", serde_json::json!({"op": op, "text": text}))
+        writeln!(stream, "{}", serde_json::json!({"op": op, "text": text, "session": session}))
             .map_err(|error| error.to_string())?;
         let mut response = String::new();
         BufReader::new(stream).take(1024 * 1024).read_line(&mut response)
@@ -127,7 +131,8 @@ impl Drop for Session {
 
 impl Session {
     fn start(id: u64, bridge: &Bridge) -> Result<Self, String> {
-        bridge.request("begin", "")?;
+        eprintln!("GigaType live: event=session_start session={id}");
+        bridge.request_for_session("begin", "", Some(id))?;
         let media = MediaGuard::pause_playing();
         play_sound(SoundCue::Listening);
         let preferred = env::var("GIGATYPE_MICROPHONE").ok();
@@ -175,6 +180,7 @@ impl Session {
                 self.pending_finals += 1;
             }
         }
+        eprintln!("GigaType live: event=segment_closed session={} segment={} voice_samples={} pending_finals={}", self.id, self.segment, self.voice_samples, self.pending_finals);
         self.segment += 1;
         self.hypotheses.clear();
         self.preview.clear();
@@ -185,6 +191,7 @@ impl Session {
 
     fn finish(&mut self, queue: &mut VecDeque<Request>, threshold: f32, bridge: &Bridge) -> Result<(), String> {
         let Some(recorder) = self.recorder.take() else { return Ok(()); };
+        eprintln!("GigaType live: event=recording_finished session={} elapsed_ms={}", self.id, self.started.elapsed().as_millis());
         let _ = bridge.request("indicator", "finishing");
         let audio = recorder.finish()?;
         self.scan(&audio, threshold);
@@ -194,8 +201,11 @@ impl Session {
     }
 }
 
-fn close_session(active: &mut Option<Session>, queue: &mut VecDeque<Request>, bridge: &Bridge) {
-    active.take();
+fn close_session(active: &mut Option<Session>, queue: &mut VecDeque<Request>, bridge: &Bridge, reason: &str) {
+    if let Some(session) = active.take() {
+        eprintln!("GigaType live: event=session_closed session={} reason={} elapsed_ms={} pending_finals={} queued={}",
+            session.id, reason, session.started.elapsed().as_millis(), session.pending_finals, queue.len());
+    }
     queue.clear();
     let _ = bridge.request("end", "");
 }
@@ -227,7 +237,13 @@ pub fn daemon() -> Result<(), String> {
             } else {
                 model.transcribe_partial(&job.samples, confidence)
             };
-            eprintln!("GigaType live: {} recognition in {:.2}s", if job.final_text { "final" } else { "partial" }, started.elapsed().as_secs_f64());
+            match &text {
+                Ok(hypothesis) => eprintln!("GigaType live: event=recognition session={} segment={} final={} audio_ms={} elapsed_ms={} chars={} reliable_chars={}",
+                    job.session, job.segment, job.final_text, job.samples.len() * 1000 / RATE,
+                    started.elapsed().as_millis(), hypothesis.text.chars().count(), hypothesis.preview.chars().count()),
+                Err(error) => eprintln!("GigaType live: event=recognition_error session={} segment={} final={} error={error}",
+                    job.session, job.segment, job.final_text),
+            }
             if outgoing.send(ResultText { session: job.session, segment: job.segment,
                 final_text: job.final_text, text }).is_err() { break; }
         }
@@ -253,32 +269,49 @@ pub fn daemon() -> Result<(), String> {
         libc::signal(libc::SIGTERM, stop_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, stop_signal as *const () as libc::sighandler_t);
     }
+    eprintln!("GigaType live: event=settings pid={} interval_ms={} pause_ms={} initial_ms={} confirmations={} min_confidence={} max_session_ms={}",
+        std::process::id(), interval.as_millis(), pause * 1000 / RATE, initial_audio * 1000 / RATE,
+        confirmations, confidence, maximum.as_millis());
     eprintln!("GigaType live: ready; IBus inline composition, F9 start/stop, Shift+F9 cancel");
 
     while !STOP.load(Ordering::Relaxed) {
         if suspend.resumed() && active.is_some() {
-            close_session(&mut active, &mut queue, &bridge);
+            close_session(&mut active, &mut queue, &bridge, "resume_from_suspend");
         }
         if active.is_some() && checked_focus.elapsed() >= Duration::from_millis(200) {
             checked_focus = Instant::now();
-            if !bridge.request("state", "").ok().is_some_and(|value| value["active"] == true) {
-                close_session(&mut active, &mut queue, &bridge);
+            let state = bridge.request("state", "");
+            if let Err(error) = &state {
+                eprintln!("GigaType live: event=bridge_state_error error={error}");
+            }
+            if !state.ok().is_some_and(|value| value["active"] == true) {
+                close_session(&mut active, &mut queue, &bridge, "input_context_inactive");
                 notify("Диктовка остановлена", "Поле ввода изменилось или начат ручной ввод.");
             }
         }
         while let Ok(result) = results.try_recv() {
             busy = false;
-            let Some(session) = active.as_mut().filter(|session| session.id == result.session) else { continue; };
-            if !result.final_text && (session.segment != result.segment || session.recorder.is_none()) { continue; }
+            let Some(session) = active.as_mut().filter(|session| session.id == result.session) else {
+                eprintln!("GigaType live: event=result_discarded session={} segment={} reason=session_closed", result.session, result.segment);
+                continue;
+            };
+            if !result.final_text && (session.segment != result.segment || session.recorder.is_none()) {
+                eprintln!("GigaType live: event=result_discarded session={} segment={} reason=obsolete_preview", result.session, result.segment);
+                continue;
+            }
             let outcome = result.text.and_then(|hypothesis| {
                 if result.final_text {
                     // Pauses are not automatic sentence boundaries.
                     let text = super::format_transcript(&hypothesis.text, false);
                     session.pending_finals = session.pending_finals.saturating_sub(1);
                     if !text.is_empty() {
+                        eprintln!("GigaType live: event=commit_requested session={} segment={} chars={}", session.id, result.segment, text.chars().count());
                         bridge.request("commit", &text)?;
+                        eprintln!("GigaType live: event=commit_bridge_accepted session={} segment={} application_ack=false", session.id, result.segment);
                         save_history(&text)?;
+                        eprintln!("GigaType live: event=history_saved session={} segment={}", session.id, result.segment);
                     } else {
+                        eprintln!("GigaType live: event=empty_final session={} segment={}", session.id, result.segment);
                         bridge.request("preview", "")?;
                     }
                 } else {
@@ -299,25 +332,31 @@ pub fn daemon() -> Result<(), String> {
                         // final recognition remains authoritative, including deletions.
                         if !common.is_empty() && !session.preview.starts_with(common) {
                             bridge.request("preview", common)?;
+                            eprintln!("GigaType live: event=preview_sent session={} segment={} chars={}", session.id, result.segment, common.chars().count());
                             session.preview = common.to_owned();
+                        } else {
+                            eprintln!("GigaType live: event=preview_retained session={} segment={} candidate_chars={} retained_chars={}",
+                                session.id, result.segment, common.chars().count(), session.preview.chars().count());
                         }
                     }
                 }
                 Ok(())
             });
             if let Err(error) = outcome {
-                close_session(&mut active, &mut queue, &bridge);
+                eprintln!("GigaType live: event=result_error error={error}");
+                close_session(&mut active, &mut queue, &bridge, "result_error");
                 notify("Ошибка диктовки", &error);
             }
         }
         if active.as_ref().is_some_and(|session| session.recorder.is_none() && session.pending_finals == 0) {
-            close_session(&mut active, &mut queue, &bridge);
+            close_session(&mut active, &mut queue, &bridge, "completed");
             play_sound(SoundCue::Transcribing);
         }
         if let Some(session) = active.as_mut() {
             if session.recorder.is_some() && session.started.elapsed() >= maximum {
+                eprintln!("GigaType live: event=session_time_limit session={}", session.id);
                 if let Err(error) = session.finish(&mut queue, threshold, &bridge) {
-                    close_session(&mut active, &mut queue, &bridge);
+                    close_session(&mut active, &mut queue, &bridge, "finish_error");
                     notify("Ошибка диктовки", &error);
                 }
             }
@@ -331,6 +370,9 @@ pub fn daemon() -> Result<(), String> {
                         session.scan(&audio, threshold);
                         if session.voice_samples > 0 && (audio.len().saturating_sub(session.voice_end) >= pause
                             || audio.len().saturating_sub(session.segment_start) >= RATE * 18) {
+                            eprintln!("GigaType live: event=segment_boundary session={} segment={} silence_ms={} segment_ms={}",
+                                session.id, session.segment, audio.len().saturating_sub(session.voice_end) * 1000 / RATE,
+                                audio.len().saturating_sub(session.segment_start) * 1000 / RATE);
                             session.final_segment(&audio, &mut queue);
                         } else if !busy && queue.is_empty() && session.pending_finals == 0
                             && session.voice_samples >= RATE / 5 && session.last_preview.elapsed() >= interval
@@ -343,7 +385,8 @@ pub fn daemon() -> Result<(), String> {
                         }
                     }
                     Err(error) => {
-                        close_session(&mut active, &mut queue, &bridge);
+                        eprintln!("GigaType live: event=microphone_error error={error}");
+                        close_session(&mut active, &mut queue, &bridge, "microphone_error");
                         notify("Ошибка микрофона", &error);
                     }
                 }
@@ -360,6 +403,9 @@ pub fn daemon() -> Result<(), String> {
                 stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
                 let mut command = String::new();
                 if BufReader::new(&stream).take(128).read_line(&mut command).is_err() { continue; }
+                if matches!(command.trim(), "toggle" | "cancel" | "quit") {
+                    eprintln!("GigaType live: event=command command={} session={:?}", command.trim(), active.as_ref().map(|session| session.id));
+                }
                 let response: Result<String, String> = match command.trim() {
                     "status" => Ok(match &active {
                         None => "idle (live mode)",
@@ -382,7 +428,7 @@ pub fn daemon() -> Result<(), String> {
                         }
                     }
                     "cancel" => {
-                        close_session(&mut active, &mut queue, &bridge);
+                        close_session(&mut active, &mut queue, &bridge, "user_cancel");
                         Ok("cancelled".into())
                     }
                     "quit" => {
@@ -394,7 +440,8 @@ pub fn daemon() -> Result<(), String> {
                 match response {
                     Ok(message) => { writeln!(stream, "{message}").ok(); }
                     Err(error) => {
-                        close_session(&mut active, &mut queue, &bridge);
+                        eprintln!("GigaType live: event=command_error error={error}");
+                        close_session(&mut active, &mut queue, &bridge, "command_error");
                         notify("Ошибка диктовки", &error);
                         writeln!(stream, "error: {error}").ok();
                     }
@@ -404,7 +451,7 @@ pub fn daemon() -> Result<(), String> {
             Err(error) => return Err(error.to_string()),
         }
     }
-    close_session(&mut active, &mut queue, &bridge);
+    close_session(&mut active, &mut queue, &bridge, "daemon_shutdown");
     let _ = std::fs::remove_file(path);
     Ok(())
 }
