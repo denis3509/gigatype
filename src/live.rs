@@ -116,6 +116,7 @@ struct Session {
     voice_end: usize,
     pending_finals: usize,
     hypotheses: VecDeque<String>,
+    preview: String,
 }
 
 impl Drop for Session {
@@ -143,7 +144,7 @@ impl Session {
         Ok(Self { id, recorder: Some(recorder), media: Some(media), started: now,
             last_poll: now, last_preview: now, scanned: 0, segment_start: 0,
             segment: 0, voice_samples: 0, voice_end: 0, pending_finals: 0,
-            hypotheses: VecDeque::new() })
+            hypotheses: VecDeque::new(), preview: String::new() })
     }
 
     fn scan(&mut self, audio: &[f32], threshold: f32) {
@@ -176,6 +177,7 @@ impl Session {
         }
         self.segment += 1;
         self.hypotheses.clear();
+        self.preview.clear();
         self.segment_start = audio.len();
         self.voice_samples = 0;
         self.voice_end = audio.len();
@@ -292,7 +294,13 @@ pub fn daemon() -> Result<(), String> {
                         // A truncated subword is shown only after repeated confirmation.
                         // Sentence-final punctuation waits for final recognition.
                         let common = common.trim_end_matches(|c: char| c.is_whitespace() || ".!?…,:;".contains(c));
-                        bridge.request("preview", common)?;
+                        // Confidence filtering can temporarily retract the stable prefix.
+                        // Keep the displayed draft until there is new text or a correction;
+                        // final recognition remains authoritative, including deletions.
+                        if !common.is_empty() && !session.preview.starts_with(common) {
+                            bridge.request("preview", common)?;
+                            session.preview = common.to_owned();
+                        }
                     }
                 }
                 Ok(())

@@ -68,14 +68,17 @@ every 500 ms after at least 1200 ms of phrase audio; actual latency also include
 inference time and confirmation. Only the common prefix of two consecutive
 confidence-filtered hypotheses is previewed. The first token below the configured
 posterior threshold holds back the remaining draft until it becomes more reliable
-or final recognition completes. Final recognition retains the entire result.
+or final recognition completes. If the stable prefix becomes empty or merely
+shortens text already shown, the displayed draft is kept until a substantive
+revision or final recognition arrives. Final recognition retains the entire result.
 These token posteriors are not calibrated probabilities of correctness: a stable,
 high-scoring hypothesis may still be wrong.
 
 The confirmed draft is revealed one Unicode character at a time with a default
 12 ms interval, speeding up for long additions. Corrections preserve the common
-prefix. A correction or shortened hypothesis replaces the displayed draft in one
-update; only a newly added suffix is animated. This is presentation smoothing of available hypotheses, not a new streaming
+prefix. A substantive correction replaces the displayed draft in one update;
+only a newly added suffix is animated. Final recognition can also shorten or
+clear the draft. This is presentation smoothing of available hypotheses, not a new streaming
 speech model. `GIGATYPE_LIVE_CHARACTER_MS=0` disables the animation.
 
 Where the app supplies IBus surrounding text, the preceding 512 characters are
