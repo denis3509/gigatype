@@ -1,0 +1,8 @@
+{
+  "uuid": "gigatype-status@denis3509.local",
+  "name": "GigaType Status",
+  "description": "Shows local GigaType dictation status in the top bar without taking keyboard focus.",
+  "shell-version": ["46"],
+  "url": "https://github.com/denis3509/gigatype",
+  "version": 1
+}

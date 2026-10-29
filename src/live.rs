@@ -145,7 +145,6 @@ impl Session {
             }
         };
         let now = Instant::now();
-        notify("Диктовка", "Текст появляется во время речи. F9 — закончить; Shift+F9 — остановить, сохранив черновик.");
         Ok(Self { id, recorder: Some(recorder), media: Some(media), started: now,
             last_poll: now, last_preview: now, scanned: 0, segment_start: 0,
             segment: 0, voice_samples: 0, voice_end: 0, pending_finals: 0,
@@ -286,7 +285,6 @@ pub fn daemon() -> Result<(), String> {
             }
             if !state.ok().is_some_and(|value| value["active"] == true) {
                 close_session(&mut active, &mut queue, &bridge, "input_context_inactive");
-                notify("Диктовка остановлена", "Поле ввода изменилось или начат ручной ввод.");
             }
         }
         while let Ok(result) = results.try_recv() {

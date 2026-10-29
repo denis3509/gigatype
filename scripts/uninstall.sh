@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if command -v gnome-extensions >/dev/null 2>&1; then
+  gnome-extensions disable gigatype-status@denis3509.local 2>/dev/null || true
+  gnome-extensions uninstall gigatype-status@denis3509.local 2>/dev/null || true
+fi
+
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user disable --now gigatype.service 2>/dev/null || true
   rm -f "${HOME}/.config/systemd/user/gigatype.service"

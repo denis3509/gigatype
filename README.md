@@ -162,6 +162,31 @@ systemctl --user daemon-reload
 systemctl --user restart gigatype.service
 ```
 
+## GNOME top-bar status
+
+On GNOME Shell 46, install the optional status extension from this checkout:
+
+```bash
+./scripts/install-gnome-extension.sh
+```
+
+It shows a muted microphone while idle, green **Диктовка** while recording,
+amber **Обработка** while recognizing, and a disabled microphone when the daemon
+is unavailable. It is intentionally non-interactive so it does not take focus
+from the dictation field. Continue using F9 and Shift+F9 as usual.
+
+The extension polls the existing local status socket asynchronously every 500 ms;
+requests have a timeout and all timers/connections are cleaned up on disable.
+No transcript or audio is sent to GNOME Shell. Routine live-mode start/stop
+notifications are removed; error notifications remain. The caret badge is separate
+and can still be disabled with `GIGATYPE_LIVE_INDICATOR=0`.
+
+GNOME may require a Shell reload to discover a newly installed extension. On X11,
+press Alt+F2, type `r`, and press Enter; on Wayland, log out and back in. Updating
+an already loaded extension also requires a Shell reload. The installer preserves
+other enabled extensions. Disable it with
+`gnome-extensions disable gigatype-status@denis3509.local`.
+
 ## Diagnostic log files
 
 For GNOME/X11 troubleshooting, the daemon records session/segment IDs, recognition
