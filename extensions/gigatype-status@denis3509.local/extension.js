@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
@@ -8,10 +7,10 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
 const STATES = {
-    idle: ['audio-input-microphone-symbolic', '', 'Диктовка готова — F9', 'idle'],
-    recording: ['media-record-symbolic', 'Диктовка', 'Идёт диктовка — F9 завершить', 'recording'],
-    transcribing: ['view-refresh-symbolic', 'Обработка', 'Распознавание речи', 'processing'],
-    offline: ['microphone-disabled-symbolic', '', 'Служба GigaType недоступна', 'offline'],
+    idle: ['audio-input-microphone-symbolic', 'Диктовка готова — F9', 'idle'],
+    recording: ['audio-input-microphone-symbolic', 'Идёт диктовка — F9 завершить', 'recording'],
+    transcribing: ['audio-input-microphone-symbolic', 'Распознавание речи', 'processing'],
+    offline: ['microphone-disabled-symbolic', 'Служба GigaType недоступна', 'offline'],
 };
 
 export default class GigaTypeStatus extends Extension {
@@ -24,9 +23,7 @@ export default class GigaTypeStatus extends Extension {
         this._indicator.can_focus = false;
         this._box = new St.BoxLayout({style_class: 'gigatype-status'});
         this._icon = new St.Icon({style_class: 'system-status-icon'});
-        this._label = new St.Label({y_align: Clutter.ActorAlign.CENTER});
         this._box.add_child(this._icon);
-        this._box.add_child(this._label);
         this._indicator.add_child(this._box);
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'right');
         this._display(run, 'offline');
@@ -41,10 +38,8 @@ export default class GigaTypeStatus extends Extension {
         if (!run.active || run.state === state)
             return;
         run.state = state;
-        const [icon, label, description, style] = STATES[state];
+        const [icon, description, style] = STATES[state];
         this._icon.icon_name = icon;
-        this._label.text = label;
-        this._label.visible = Boolean(label);
         this._indicator.accessible_name = description;
         this._box.set_style_class_name(`gigatype-status gigatype-${style}`);
     }
@@ -128,7 +123,6 @@ export default class GigaTypeStatus extends Extension {
         this._indicator = null;
         this._box = null;
         this._icon = null;
-        this._label = null;
         this._run = null;
     }
 }

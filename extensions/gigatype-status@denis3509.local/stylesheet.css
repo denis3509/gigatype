@@ -1,5 +1,4 @@
-.gigatype-status { spacing: 6px; }
 .gigatype-idle { color: #b9bec7; }
 .gigatype-recording { color: #80df9a; }
-.gigatype-processing { color: #f6c85f; }
+.gigatype-processing { color: #80df9a; }
 .gigatype-offline { color: #777e89; }

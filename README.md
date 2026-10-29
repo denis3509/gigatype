@@ -170,9 +170,9 @@ On GNOME Shell 46, install the optional status extension from this checkout:
 ./scripts/install-gnome-extension.sh
 ```
 
-It shows a muted microphone while idle, green **Диктовка** while recording,
-amber **Обработка** while recognizing, and a disabled microphone when the daemon
-is unavailable. It is intentionally non-interactive so it does not take focus
+It shows only a microphone icon: muted while idle, green while recording or
+recognizing, and disabled when the daemon is unavailable. There is no visible
+status text; accessible status descriptions remain available. It is intentionally non-interactive so it does not take focus
 from the dictation field. Continue using F9 and Shift+F9 as usual.
 
 The extension polls the existing local status socket asynchronously every 500 ms;
