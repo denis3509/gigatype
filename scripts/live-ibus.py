@@ -262,6 +262,12 @@ class DictationEngine(IBus.Engine):
 
         self.animation = GLib.timeout_add(delay, step)
 
+    def forget_draft(self):
+        # Local state only: IBus/client already owns focus-out/reset commits.
+        self.stop_animation()
+        self.target = ""
+        self.text = ""
+
     def clear(self):
         self.stop_animation()
         self.target = ""
@@ -287,7 +293,7 @@ class DictationEngine(IBus.Engine):
         text = IBus.Text.new_from_string(value)
         text.append_attribute(IBus.AttrType.UNDERLINE, IBus.AttrUnderline.SINGLE, 0, len(value))
         self.update_preedit_text_with_mode(
-            text, len(value), bool(value), IBus.PreeditFocusMode.CLEAR
+            text, len(value), bool(value), IBus.PreeditFocusMode.COMMIT
         )
 
     def do_focus_in(self):
@@ -295,26 +301,26 @@ class DictationEngine(IBus.Engine):
         self.focused = True
         self.surrounding_before = None
         self.get_surrounding_text()
-        self.controller.engine = self
         if self.controller.active and not self.controller.same_context():
-            self.controller.cancel("context_changed_on_focus_in")
+            self.controller.cancel("context_changed_on_focus_in", preedit_handled=True)
+        self.controller.engine = self
 
     def do_focus_out(self):
         diagnostic("focus_out", active=self.controller.active)
         self.focused = False
         if self.controller.active:
-            self.controller.cancel("focus_out")
+            self.controller.cancel("focus_out", preedit_handled=True)
 
     def do_reset(self):
         diagnostic("reset", active=self.controller.active)
         if self.controller.active:
-            self.controller.cancel("ibus_reset")
+            self.controller.cancel("ibus_reset", preedit_handled=True)
 
     def do_disable(self):
         diagnostic("disable", active=self.controller.active)
         self.focused = False
         if self.controller.active:
-            self.controller.cancel("engine_disabled")
+            self.controller.cancel("engine_disabled", preedit_handled=True)
 
     def do_process_key_event(self, keyval, keycode, state):
         # Let ordinary keyboard input through, but stop revising dictation first.
@@ -390,15 +396,33 @@ class Controller:
             self.bus.set_global_engine_async(previous, 1000, None, restored, None)
         return False
 
-    def cancel(self, reason="unspecified"):
+    def cancel(self, reason="unspecified", preedit_handled=False):
+        engine = self.engine
+        draft = engine.text if engine else ""
+        # Reset/focus-out/disable already commit COMMIT-mode preedit in IBus or
+        # the client. Never send that text a second time, or into a new context.
+        commit_here = bool(not preedit_handled and self.valid())
         diagnostic("cancel", session=self.session, reason=reason, active=self.active,
-                   focused=bool(self.engine and self.engine.focused),
-                   draft_chars=len(self.engine.text) if self.engine else 0)
+                   focused=bool(engine and engine.focused), draft_chars=len(draft))
+        was_active = self.active
         self.active = False
         self.indicator.hide()
-        if self.engine:
-            self.engine.clear()
-        GLib.idle_add(self.restore)
+        try:
+            if engine:
+                if was_active and commit_here and draft:
+                    # Freeze exactly what was visible, before letting a key through.
+                    engine.clear()
+                    engine.commit_text(IBus.Text.new_from_string(draft))
+                    engine.before = (engine.before + draft)[-512:]
+                    diagnostic("cancel_draft_dispatched", session=self.session,
+                               reason=reason, chars=len(draft), application_ack=False)
+                else:
+                    engine.forget_draft()
+                    if was_active and draft:
+                        diagnostic("cancel_draft_delegated", session=self.session,
+                                   reason=reason, chars=len(draft), application_ack=False)
+        finally:
+            GLib.idle_add(self.restore)
 
     def handle(self, request, reply):
         try:

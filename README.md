@@ -55,10 +55,17 @@ desktops keep the original record-then-insert mode. Requires `/usr/bin/python3`,
   cancellation, or a focus change. If a client omits caret coordinates, it appears
   near the mouse pointer instead. `GIGATYPE_LIVE_INDICATOR=0` hides the badge.
 - After a pause (1800 ms by default), the phrase is committed and dictation continues.
-- Press **F9** again to finish the final phrase, or **Shift+F9** to discard the
-  current uncommitted phrase. Phrases already committed remain in the document.
+- Press **F9** again to finish the final phrase, or **Shift+F9** to stop immediately
+  and keep the currently displayed draft. Cancellation does not wait for final
+  recognition; speech that has not appeared yet is not inserted.
 - Changing the input context, typing manually, or moving the cursor stops dictation
-  and clears the uncommitted draft. The previous keyboard engine is restored.
+  and preserves the displayed draft. The previous keyboard engine is restored.
+  Keyboard/explicit cancellation commits the visible draft in the original focused
+  field. On reset or focus loss, IBus/client handles the draft using
+  `PreeditFocusMode.COMMIT`; the bridge does not reinsert it into another field.
+  This depends on the application's IBus support, and dispatch is not an insertion
+  acknowledgment. Diagnostics distinguish `cancel_draft_dispatched` from
+  `cancel_draft_delegated`.
 - Apps that do not expose an IBus input context cannot use this mode. Set
   `GIGATYPE_LIVE=0` in a systemd user override to use the original clipboard mode.
 
